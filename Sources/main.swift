@@ -24,7 +24,7 @@ enum Mode: String, CaseIterable {
     var subtitle: String {
         switch self {
         case .auto: return "Awake when plugged in, sleeps on battery"
-        case .awake: return "Never sleeps, even on battery"
+        case .awake: return "Never sleeps, even on battery. Hot in a bag."
         case .normal: return "macOS sleeps as usual"
         }
     }
@@ -194,6 +194,21 @@ enum Power {
         ])
     }
 
+    /// True when a physical external display is online: a lid-closed Mac on
+    /// AC is then in Apple's own clamshell mode, in use as a desktop. Virtual
+    /// displays (Sidecar, AirPlay, screen-sharing tools) mostly report no
+    /// vendor and do not count; NSScreen.screens would count them.
+    static func externalDisplayOnline() -> Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var n: UInt32 = 0
+        guard CGGetOnlineDisplayList(UInt32(ids.count), &ids, &n) == .success else { return false }
+        // kDisplayVendorIDUnknown ('unkn'), and 0xFFFFFFFF for an id with no monitor.
+        let noVendor: [UInt32] = [0, 0x756E_6B6E, 0xFFFF_FFFF]
+        return ids.prefix(Int(n)).contains {
+            CGDisplayIsBuiltin($0) == 0 && !noVendor.contains(CGDisplayVendorNumber($0))
+        }
+    }
+
     static let rulePath = "/etc/sudoers.d/clamshell-awake"
 
     /// First-run setup: installs a sudoers rule that lets this user run the
@@ -281,6 +296,17 @@ final class Controller: NSObject, NSMenuDelegate {
     /// Set by a reopen: keeps the item on screen while its menu is open.
     var pinnedVisible = false
 
+    /// Keep-awake timer: when it runs out the app switches to Normal Sleep.
+    /// A wall-clock end date in UserDefaults, so it survives sleep and relaunch.
+    static let timerChoices: [Int] = [3600, 7200, 14400, 28800, 43200, 86400]
+    var timerEnd: Date? {
+        get { defaults.object(forKey: "timerEnd") as? Date }
+        set { defaults.set(newValue, forKey: "timerEnd") }
+    }
+    var timerWork: DispatchWorkItem?
+    var timerMenuItem = NSMenuItem()
+    var timerOffItem = NSMenuItem()
+
     // MARK: lifecycle
 
     func start() {
@@ -308,7 +334,13 @@ final class Controller: NSObject, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
 
+        if let end = timerEnd, end.timeIntervalSinceNow <= 0 {
+            // Ran out while the app was not running: settle into Normal Sleep
+            // first, rather than switching sleep off at launch and straight back on.
+            timerFired()
+        }
         evaluate(reason: "launch")
+        armTimer()
         // Next run-loop turn, so the menu bar item is up behind the alert.
         DispatchQueue.main.async { [weak self] in self?.offerSetup() }
     }
@@ -542,6 +574,23 @@ final class Controller: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        let tsub = NSMenu()
+        for secs in Self.timerChoices {
+            let it = NSMenuItem(title: Self.graceTitle(secs), action: #selector(pickTimer(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = secs
+            tsub.addItem(it)
+        }
+        timerOffItem = NSMenuItem(title: "Turn Off Timer", action: #selector(pickTimer(_:)), keyEquivalent: "")
+        timerOffItem.target = self
+        timerOffItem.representedObject = 0
+        tsub.addItem(timerOffItem)
+        timerMenuItem.submenu = tsub
+        timerMenuItem.toolTip = "Keeps Auto or Always Awake on for a set time, then switches to Normal Sleep. "
+            + "Picking a time while in Normal Sleep turns on Auto."
+        Self.withSubtitle(timerMenuItem, "Then back to Normal Sleep").forEach(menu.addItem)
+        menu.addItem(.separator())
+
         let policy = NSMenuItem(title: "macOS Sleep Settings", action: nil, keyEquivalent: "")
         policy.toolTip = "macOS's own timers, from System Settings (Battery, Lock Screen). Normal Sleep "
             + "follows them. Always Awake, and Auto while it keeps the Mac awake, override the sleep "
@@ -602,21 +651,117 @@ final class Controller: NSObject, NSMenuDelegate {
 
     /// An accessory app is never frontmost on its own; without the activate
     /// its alert can open behind the app in front.
+    /// With a suppressKey the alert offers "Don't show this again", and once
+    /// that is ticked with the first button it answers the first button silently.
     @discardableResult
-    static func alert(_ title: String, _ text: String, buttons: [String] = ["OK"]) -> NSApplication.ModalResponse {
+    static func alert(_ title: String, _ text: String, buttons: [String] = ["OK"],
+                      suppressKey: String? = nil) -> NSApplication.ModalResponse {
+        if let key = suppressKey, UserDefaults.standard.bool(forKey: key) { return .alertFirstButtonReturn }
         let a = NSAlert()
         a.messageText = title
         a.informativeText = text
         buttons.forEach { a.addButton(withTitle: $0) }
+        a.showsSuppressionButton = suppressKey != nil
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        return a.runModal()
+        let r = a.runModal()
+        if let key = suppressKey, r == .alertFirstButtonReturn, a.suppressionButton?.state == .on {
+            UserDefaults.standard.set(true, forKey: key)
+        }
+        return r
     }
 
     @objc func pickMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let m = Mode(rawValue: raw) else { return }
+        if m == .awake && mode != .awake && !confirmAlwaysAwake() {
+            Log.write("mode -> awake cancelled at the warning")
+            refreshUI()
+            return
+        }
         mode = m
         Log.write("mode -> \(m.rawValue)")
+        if m == .normal && timerEnd != nil {
+            cancelTimer()
+            Log.write("timer off (Normal Sleep picked)")
+        }
         evaluate(reason: "menu: \(m.rawValue)")
+    }
+
+    /// Always Awake ignores the battery: a closed Mac in a bag that cannot
+    /// sleep gets hot (docs/incident-2026-09-12-awake-in-a-bag.md). Say so first.
+    func confirmAlwaysAwake() -> Bool {
+        Self.alert("Always Awake ignores the battery",
+            "Your Mac won't sleep, even on battery with the lid closed. In a bag or backpack it can "
+                + "get hot and run the battery flat. If you'll carry it, choose Auto: on battery it "
+                + "sleeps after the lid closes.",
+            buttons: ["Use Always Awake", "Cancel"], suppressKey: "awakeWarningSuppressed") == .alertFirstButtonReturn
+    }
+
+    // MARK: keep-awake timer
+
+    @objc func pickTimer(_ sender: NSMenuItem) {
+        guard let secs = sender.representedObject as? Int else { return }
+        guard secs > 0 else {
+            cancelTimer()
+            Log.write("timer off")
+            refreshUI()
+            return
+        }
+        // The timer ends without anyone there to type a password, so it needs
+        // the passwordless rule; without it sleep would stay off at zero.
+        if !sudoOK {
+            runSetup()
+            guard sudoOK else { return }
+        }
+        if mode == .normal {
+            mode = .auto
+            Log.write("mode -> auto (timer picked in Normal Sleep)")
+        }
+        timerEnd = Date().addingTimeInterval(TimeInterval(secs))
+        Log.write("timer: Normal Sleep in \(secs)s")
+        armTimer()
+        evaluate(reason: "menu: timer")
+    }
+
+    /// Wall-clock deadline, as for the battery grace: it keeps counting while
+    /// the Mac sleeps, and fires at once on wake or launch if already past.
+    func armTimer() {
+        timerWork?.cancel()
+        timerWork = nil
+        guard let end = timerEnd else { return }
+        let item = DispatchWorkItem { [weak self] in self?.timerFired() }
+        timerWork = item
+        DispatchQueue.main.asyncAfter(wallDeadline: .now() + max(0, end.timeIntervalSinceNow), execute: item)
+    }
+
+    func cancelTimer() {
+        timerWork?.cancel()
+        timerWork = nil
+        timerEnd = nil
+    }
+
+    func timerFired() {
+        timerWork = nil
+        timerEnd = nil
+        guard mode != .normal else { refreshUI(); return }
+        Log.write("timer ended: \(mode.rawValue) -> normal")
+        mode = .normal
+        sleepDisabled = Power.readSleepDisabled()   // the cached value may be stale
+        evaluate(reason: "timer")
+        guard sleepDisabled == false else {
+            // No password prompt here (nobody may be at the Mac), so a missing
+            // rule leaves sleep off. Say so loudly rather than fail quietly.
+            Log.write("WARNING: timer ended but SleepDisabled is still \(sleepDisabled.map { $0 ? "1" : "0" } ?? "?")")
+            lastError = "Timer ended, but sleep is still off. Choose Normal Sleep again."
+            refreshUI()
+            return
+        }
+        // Lid already shut: clearing the flag alone does not sleep the Mac
+        // (see Power.forceSleep). On AC with an external display the closed Mac
+        // is in Apple's own clamshell mode, in use as a desktop: leave it.
+        if Power.lidClosed() == true, !Power.onAC() || !Power.externalDisplayOnline() {
+            Log.write(Power.forceSleep() ? "timer ended with the lid closed: sleeping now"
+                                         : "WARNING: forced sleep failed; relying on idle timer")
+        }
     }
 
     static func graceTitle(_ secs: Int) -> String {
@@ -665,6 +810,10 @@ final class Controller: NSObject, NSMenuDelegate {
     /// awake across them.
     @objc func quitRestoringSleep() {
         cancelPending()
+        if timerEnd != nil {
+            cancelTimer()   // else it fires at the next launch and flips the mode unasked
+            Log.write("quit: timer off")
+        }
         let was = Power.readSleepDisabled()
         if was == false {
             Log.write("quit: sleep already normal")
@@ -723,7 +872,7 @@ final class Controller: NSObject, NSMenuDelegate {
             it.isHidden = i >= policy.count
         }
         refreshUI()
-        guard pending != nil else { return }
+        guard pending != nil || timerEnd != nil else { return }
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refreshUI() }
         RunLoop.main.add(t, forMode: .common)   // menu tracking uses eventTracking mode
         menuTimer = t
@@ -775,7 +924,16 @@ final class Controller: NSObject, NSMenuDelegate {
             detail = "\(src) \u{00B7} Open Log for details"
         }
         if !sudoOK && mode == .auto { badge = "exclamationmark" }
-        header.update(head: head, detail: detail, error: lastError.map { "\u{26A0}\u{FE0E} " + $0 })
+        var timerText: String?
+        if let end = timerEnd {
+            let left = max(0, Int(end.timeIntervalSinceNow.rounded()))
+            timerText = String(format: "%d:%02d:%02d", left / 3600, left / 60 % 60, left % 60)
+        }
+        header.update(head: head, detail: detail,
+                      timer: timerText.map { "Timer \u{00B7} Normal Sleep in \($0)" },
+                      error: lastError.map { "\u{26A0}\u{FE0E} " + $0 })
+        timerMenuItem.title = "Keep-Awake Timer: " + (timerText.map { "\($0) left" } ?? "Off")
+        timerOffItem.isHidden = timerEnd == nil
         header.toolTip = mode.tip
         setupItems.forEach { $0.isHidden = sudoOK }
         for (m, it) in modeItems { it.state = (m == mode) ? .on : .off }
@@ -787,6 +945,7 @@ final class Controller: NSObject, NSMenuDelegate {
         hideAutoItem.state = hideInAuto ? .on : .off
         statusItem.button?.image = Self.icon(badge: badge)
         statusItem.button?.toolTip = "ClamshellAwake: \(head)\n\(detail)"
+            + (timerText.map { "\nNormal Sleep in \($0)" } ?? "")
         applyVisibility()
     }
 
@@ -835,17 +994,20 @@ final class StatusHeader: NSView {
     }
     let head = NSTextField(labelWithString: "")
     let detail = NSTextField(labelWithString: "")
+    let timer = NSTextField(labelWithString: "")
     let error = NSTextField(labelWithString: "")
     let stack: NSStackView
 
     init() {
-        stack = NSStackView(views: [head, detail, error])
+        stack = NSStackView(views: [head, detail, timer, error])
         super.init(frame: .zero)
         head.font = .systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold)
         detail.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
         detail.textColor = .secondaryLabelColor
         error.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
         error.textColor = .systemRed
+        timer.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        timer.textColor = .controlAccentColor
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 2
@@ -858,11 +1020,13 @@ final class StatusHeader: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func update(head h: String, detail d: String, error e: String?) {
+    func update(head h: String, detail d: String, timer t: String?, error e: String?) {
         head.stringValue = h
         detail.stringValue = d
         error.stringValue = e ?? ""
         error.isHidden = e == nil
+        timer.stringValue = t ?? ""
+        timer.isHidden = t == nil
         setFrameSize(stack.fittingSize)
     }
 }

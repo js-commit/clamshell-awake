@@ -1,21 +1,24 @@
 # ClamshellAwake
 
-Keep your MacBook awake with the lid closed. You don't need an external
-display or a dummy plug. When you unplug it and close the lid, it goes back
-to sleep by itself.
+**Close the lid. Your agents keep running.**
+
+You've seen them: someone walking down the hall with their MacBook held
+open in front of them, like a waiter with a tray. They can't close it,
+because if the lid shuts, the Mac sleeps and the AI agent on screen stops
+mid-task.
+
+ClamshellAwake lets the clamshell close. It's a small menu bar app: when the
+Mac is plugged in, it stays awake with the lid closed. You don't need an
+external display or a dummy plug. When you unplug it and close the lid, it
+goes back to sleep by itself, so it doesn't cook in your bag.
 
 <img src="docs/menu.png" alt="ClamshellAwake menu" width="332">
 
-A MacBook goes to sleep as soon as you close the lid, unless an external
-display is connected. That is bad if you run long jobs with the lid shut,
-such as builds, downloads, AI agents or a small home server. macOS has one
-hidden override, `pmset disablesleep`. But if you leave it on, a MacBook
-in a bag can't sleep. It gets hot and the battery goes flat.
-
-ClamshellAwake is a small menu bar app that controls that switch for you.
-When the Mac is plugged in, it stays awake with the lid closed. When it is
-on battery and you close the lid, the Mac goes to sleep after a short delay.
-If you plug it back in before the delay ends, it stays awake.
+Why an app? macOS sleeps a MacBook as soon as the lid closes, unless an
+external display is connected. Its one hidden override, `pmset
+disablesleep`, is all or nothing: leave it on, and a MacBook in a bag can't
+sleep, gets hot, and runs the battery flat. ClamshellAwake turns it on and
+off for you, based on power and the lid.
 
 ## Install
 
@@ -63,11 +66,27 @@ I close the lid now?*
 | ! | Setup is not finished |
 | ? | The app can't read the sleep setting (see the log) |
 
+## Keep-Awake Timer
+
+<img src="docs/timer.png" alt="Keep-Awake Timer submenu" width="450">
+
+Need the Mac awake for a fixed time, such as an overnight agent run? Choose
+**Keep-Awake Timer** and a time from 1 to 24 hours. The top of the menu
+counts down. At zero, the app switches to **Normal Sleep**. If the lid is
+already closed, the Mac goes to sleep then, unless it is plugged in with an
+external display connected.
+
+The timer works with **Auto** or **Always Awake**. If you choose a time
+while in Normal Sleep, the app turns on Auto. The timer keeps counting
+while the Mac sleeps and after a restart. To stop it, choose **Turn Off
+Timer**, **Normal Sleep**, or **Quit and Restore Normal Sleep**.
+
 ## Safety
 
 - **Don't put an awake Mac in a bag or sleeve.** It can't cool down there.
   Use **Auto**: it puts the Mac to sleep on battery when the lid is closed.
 - **Always Awake** ignores battery. Use it only when the Mac is on a desk.
+  Each time you choose it, the app shows a warning. You can turn the warning off.
 - Put a closed, awake laptop on a hard surface so air can move around it.
 - **Quit and Restore Normal Sleep** in the menu turns normal sleep back on.
   If you log out or restart, the setting stays as it was.
