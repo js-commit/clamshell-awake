@@ -1,0 +1,652 @@
+// ClamshellAwake - menu bar toggle for `pmset disablesleep`.
+// Keeps a MacBook awake with the lid closed (no external display needed),
+// automatically on AC and, after a cooldown, lets it sleep normally on battery.
+
+import AppKit
+import IOKit
+import IOKit.ps
+import IOKit.pwr_mgt
+import ServiceManagement
+
+enum Mode: String, CaseIterable {
+    case auto, awake, normal
+    var title: String {
+        switch self {
+        case .auto: return "Auto (awake on AC; on battery, sleeps after the lid closes)"
+        case .awake: return "Always Awake (never sleeps, lid open or closed)"
+        case .normal: return "Normal Sleep (macOS rules: lid closed sleeps, idle timers apply)"
+        }
+    }
+
+    /// The one surprising thing Auto does, spelled out in the menu itself
+    /// rather than left to the README.
+    var note: String? {
+        switch self {
+        case .auto: return "\u{26A0}\u{FE0E} On battery, stays awake while the lid is open \u{2014} no idle sleep."
+        case .awake, .normal: return nil
+        }
+    }
+
+    /// Tooltip: the full story behind each mode, including what Auto costs.
+    var tip: String {
+        switch self {
+        case .auto:
+            return "On AC: never sleeps, so the Mac keeps serving with the lid shut.\n"
+                + "On battery: the override is held while the lid is open, so closing the lid "
+                + "does not sleep the Mac on the spot \u{2014} it starts the Battery Grace countdown "
+                + "instead, and normal sleep resumes if AC has not returned by the time it runs out.\n"
+                + "Trade-off: a lid-open Mac on battery will not idle-sleep, so left unplugged and "
+                + "untouched it runs until the battery is flat. The display still turns off on its own timer."
+        case .awake:
+            return "Never sleeps on AC or battery, lid open or closed, whatever System Settings say. "
+                + "The display still turns off on its own timer."
+        case .normal:
+            return "macOS's own rules, unchanged: the idle timers below apply and closing the lid "
+                + "sleeps the Mac. Auto's lid behaviour does not affect this mode."
+        }
+    }
+}
+
+enum Log {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/clamshell-awake.log")
+    static let fmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f
+    }()
+    static func write(_ s: String) {
+        let line = "\(fmt.string(from: Date())) \(s)\n"
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close()
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
+enum Shell {
+    static func run(_ path: String, _ args: [String]) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return (-1, "\(error)") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+}
+
+enum Power {
+    static func onAC() -> Bool {
+        let snap = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        guard let t = IOPSGetProvidingPowerSourceType(snap)?.takeUnretainedValue() else { return true }
+        return (t as String) == (kIOPSACPowerValue as String)
+    }
+
+    /// True when the lid is shut. nil on a Mac with no clamshell, and on any
+    /// read failure: callers fall back to the old unplug-keyed behaviour.
+    static func lidClosed() -> Bool? {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0 else { return nil }
+        defer { IOObjectRelease(root) }
+        let v = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString,
+                                                kCFAllocatorDefault, 0)?.takeRetainedValue()
+        return v as? Bool
+    }
+
+    /// Reads the live SleepDisabled flag from `pmset -g`.
+    /// One line per power profile summarising the macOS idle-sleep rules from
+    /// System Settings (Battery / Energy), read from `pmset -g custom`.
+    static func policySummary() -> [String] {
+        let (_, out) = Shell.run("/usr/bin/pmset", ["-g", "custom"])
+        var profiles: [(String, [String: Int])] = []
+        for raw in out.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasSuffix(":") {
+                profiles.append((String(line.dropLast()), [:]))
+            } else if !profiles.isEmpty {
+                let parts = line.split(separator: " ")
+                if parts.count >= 2, let v = Int(parts.last!) {
+                    profiles[profiles.count - 1].1[parts.dropLast().joined(separator: " ")] = v
+                }
+            }
+        }
+        return profiles.map { name, kv in
+            let label = name == "AC Power" ? "AC" : name == "Battery Power" ? "Battery" : name
+            let disp = kv["displaysleep"] ?? 0
+            let slp = kv["sleep"] ?? 0
+            var parts: [String] = []
+            parts.append(disp == 0 ? "display never off" : "display off after \(disp) min")
+            if slp == 0 { parts.append("never sleeps when idle") }
+            else if slp <= disp { parts.append("then sleeps") }
+            else { parts.append("sleeps after \(slp) min") }
+            if kv["womp"] == 1 { parts.append("wakes for network") }
+            return "\(label): " + parts.joined(separator: ", ")
+        }
+    }
+
+    /// Sleeps the Mac now, as the Apple menu does. Clearing `disablesleep`
+    /// with the lid already shut does not sleep the Mac: macOS only consults
+    /// the flag on the lid-close transition, so after that it is down to the
+    /// idle timer, and any PreventUserIdleSystemSleep assertion (audio,
+    /// DaVinci Resolve's "Background Activity", a backup) holds that off
+    /// indefinitely. A forced sleep ignores those assertions. No root needed.
+    static func forceSleep() -> Bool {
+        let port = IOPMFindPowerManagement(kIOMainPortDefault)
+        guard port != 0 else { return false }
+        defer { IOServiceClose(port) }
+        return IOPMSleepSystem(port) == kIOReturnSuccess
+    }
+
+    /// True when the sudoers rule from install-sudoers.sh lets this user run
+    /// pmset without a password. Re-writes the flag's current value through
+    /// `sudo -n`, which is a no-op for pmset but exercises the exact rule.
+    /// (`sudo -l` is not usable here: for an admin it approves any command.)
+    static func sudoRuleInstalled(current: Bool?) -> Bool {
+        guard let cur = current else { return false }
+        return Shell.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", cur ? "1" : "0"]).0 == 0
+    }
+
+    static func readSleepDisabled() -> Bool? {
+        let (_, out) = Shell.run("/usr/bin/pmset", ["-g"])
+        for line in out.split(separator: "\n") where line.contains("SleepDisabled") {
+            return line.trimmingCharacters(in: .whitespaces).hasSuffix("1")
+        }
+        return nil
+    }
+
+    /// Writes the flag. Tries passwordless sudo (sudoers drop-in) first, then,
+    /// if allowed, an admin-password prompt via osascript.
+    static func writeSleepDisabled(_ on: Bool, allowPrompt: Bool) -> Bool {
+        let v = on ? "1" : "0"
+        let (code, out) = Shell.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", v])
+        if code == 0 { return true }
+        Log.write("sudo -n failed (\(code)): \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        guard allowPrompt else { return false }
+        let script = "do shell script \"/usr/bin/pmset -a disablesleep \(v)\" with administrator privileges"
+        let (c2, o2) = Shell.run("/usr/bin/osascript", ["-e", script])
+        if c2 != 0 { Log.write("osascript failed (\(c2)): \(o2.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        return c2 == 0
+    }
+}
+
+final class Controller: NSObject, NSMenuDelegate {
+    /// Battery grace: how long Auto keeps the Mac awake after AC drops.
+    static let graceChoices: [Int] = [60, 120, 300, 600, 900, 1800, 3600]
+    static let defaultGrace = 600
+    var delaySeconds: TimeInterval {
+        let v = defaults.integer(forKey: "graceSeconds")
+        return TimeInterval(v > 0 ? v : Self.defaultGrace)
+    }
+
+    let defaults = UserDefaults.standard
+    var mode: Mode {
+        get { Mode(rawValue: defaults.string(forKey: "mode") ?? "") ?? .auto }
+        set { defaults.set(newValue.rawValue, forKey: "mode") }
+    }
+
+    var sleepDisabled: Bool?          // last known real value of the flag
+    var pending: DispatchWorkItem?    // battery cooldown
+    var pendingFireAt: Date?
+    var pendingStartedAt: Date?
+    var lastError: String?
+    var sudoOK = true
+    var source: CFRunLoopSource?
+    var lidClosed: Bool?              // last known lid state, nil if unreadable
+    var notifyPort: IONotificationPortRef?
+    var clamshellNote: io_object_t = 0
+
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    let menu = NSMenu()
+    var statusLine = NSMenuItem()
+    var errorLine = NSMenuItem()
+    var policyHeader = NSMenuItem(title: "macOS sleep rules (System Settings)", action: nil, keyEquivalent: "")
+    var policyLines: [NSMenuItem] = []
+    var modeItems: [Mode: NSMenuItem] = [:]
+    var graceItems: [Int: NSMenuItem] = [:]
+    var loginItem = NSMenuItem()
+    var hideAutoItem = NSMenuItem()
+    var menuTimer: Timer?
+    /// Default on: the icon leaves the menu bar in Auto (the mode that needs
+    /// no attention) and shows in Always Awake / Normal Sleep, or whenever
+    /// something is wrong. Reopening the app brings the menu back.
+    var hideInAuto: Bool {
+        get { defaults.object(forKey: "hideInAuto") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "hideInAuto") }
+    }
+    /// Set by a reopen: keeps the item on screen while its menu is open.
+    var pinnedVisible = false
+
+    // MARK: lifecycle
+
+    func start() {
+        buildMenu()
+        sleepDisabled = Power.readSleepDisabled()
+        let lid = Power.lidClosed().map { $0 ? "closed" : "open" } ?? "?"
+        Log.write("launch: mode=\(mode.rawValue) ac=\(Power.onAC()) lid=\(lid) SleepDisabled=\(sleepDisabled.map { $0 ? "1" : "0" } ?? "?")")
+        checkSudo()
+        registerLoginItemOnFirstRun()
+
+        // Fires only on AC <-> battery transitions; no polling.
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        if let src = IOPSCreateLimitedPowerNotification({ ctx in
+            guard let ctx else { return }
+            Unmanaged<Controller>.fromOpaque(ctx).takeUnretainedValue().powerChanged()
+        }, ctx)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
+            source = src
+        } else {
+            Log.write("ERROR: could not register power-source notification")
+        }
+        watchClamshell()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
+
+        evaluate(reason: "launch")
+    }
+
+    /// Re-checks only while the rule is missing, so a working install costs
+    /// one sudo call at launch and nothing afterwards.
+    func checkSudo() {
+        let ok = Power.sudoRuleInstalled(current: sleepDisabled ?? Power.readSleepDisabled())
+        if ok != sudoOK { Log.write(ok ? "sudoers rule found" : "WARNING: no passwordless sudo for pmset; Auto cannot restore sleep on battery. Run install-sudoers.sh") }
+        sudoOK = ok
+    }
+
+    /// Lid open/close drives the battery grace, so the countdown starts when
+    /// the lid shuts rather than when AC was pulled. IOPMrootDomain's general
+    /// interest channel carries kIOPMMessageClamshellStateChange; rather than
+    /// hard-code that message id, re-read the lid on any message and act only
+    /// on a real change. The reads are one registry lookup and cost nothing.
+    func watchClamshell() {
+        lidClosed = Power.lidClosed()
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0, let port = IONotificationPortCreate(kIOMainPortDefault) else {
+            Log.write("ERROR: no clamshell notifications; Auto falls back to the unplug timer")
+            return
+        }
+        defer { IOObjectRelease(root) }
+        notifyPort = port
+        CFRunLoopAddSource(CFRunLoopGetMain(),
+                           IONotificationPortGetRunLoopSource(port).takeUnretainedValue(), .defaultMode)
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        let r = IOServiceAddInterestNotification(port, root, kIOGeneralInterest, { ctx, _, _, _ in
+            guard let ctx else { return }
+            Unmanaged<Controller>.fromOpaque(ctx).takeUnretainedValue().clamshellChanged()
+        }, ctx, &clamshellNote)
+        if r != KERN_SUCCESS {
+            Log.write("ERROR: clamshell notification failed (\(r)); Auto falls back to the unplug timer")
+        }
+    }
+
+    func clamshellChanged() {
+        let now = Power.lidClosed()
+        guard now != lidClosed else { return }
+        lidClosed = now
+        Log.write("lid \(now == true ? "closed" : "open")")
+        evaluate(reason: "lid")
+    }
+
+    func powerChanged() {
+        Log.write("power source: \(Power.onAC() ? "AC" : "battery")")
+        evaluate(reason: "power change")
+    }
+
+    @objc func willSleep() {
+        Log.write("system sleeping (ac=\(Power.onAC()))")
+    }
+
+    @objc func didWake() {
+        Log.write("system woke (ac=\(Power.onAC()))")
+        sleepDisabled = Power.readSleepDisabled()
+        evaluate(reason: "wake")
+    }
+
+    // MARK: policy
+
+    func evaluate(reason: String) {
+        let ac = Power.onAC()
+        lidClosed = Power.lidClosed()
+        switch mode {
+        case .awake:
+            cancelPending()
+            apply(true, reason: reason)
+        case .normal:
+            cancelPending()
+            apply(false, reason: reason)
+        case .auto:
+            if ac {
+                cancelPending()
+                apply(true, reason: reason)
+            } else if lidClosed == false {
+                // On battery with the lid open: hold the override anyway. The
+                // flag has to already be 1 when the lid shuts - macOS goes from
+                // clamshell-closed to sleep in about 8ms, far too fast to react
+                // to - so the grace can only start at the lid close if the Mac
+                // was never allowed to sleep before it. A Mac that cannot read
+                // its lid state (nil) keeps the old unplug-keyed behaviour.
+                cancelPending()
+                apply(true, reason: reason)
+            } else if sleepDisabled == false {
+                cancelPending()            // already sleeping normally
+            } else if pending == nil {
+                schedule()
+            }
+        }
+        refreshUI()
+    }
+
+    func schedule(startedAt: Date = Date()) {
+        let fireAt = startedAt.addingTimeInterval(delaySeconds)
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pending = nil
+            self.pendingFireAt = nil
+            self.pendingStartedAt = nil
+            if Power.onAC() {
+                Log.write("cooldown fired but on AC; staying awake")
+            } else {
+                self.apply(false, reason: "battery for \(Int(self.delaySeconds))s")
+                if self.sleepDisabled == false && Power.lidClosed() == true {
+                    // The flag alone does nothing now that the lid is already
+                    // shut (see Power.forceSleep); put the Mac to sleep ourselves.
+                    Log.write(Power.forceSleep() ? "lid closed: sleeping now"
+                                                 : "WARNING: forced sleep failed; relying on idle timer")
+                }
+            }
+            self.refreshUI()
+        }
+        pending = item
+        pendingFireAt = fireAt
+        pendingStartedAt = startedAt
+        // Wall-clock deadline: a DispatchTime (.now()) deadline stops counting while the
+        // Mac sleeps (mach_absolute_time pauses in sleep, on Apple silicon too), which
+        // would fire the cooldown late after a wake.
+        let wait = max(0, fireAt.timeIntervalSinceNow)
+        DispatchQueue.main.asyncAfter(wallDeadline: .now() + wait, execute: item)
+        let why = lidClosed == true ? "lid closed on battery" : "battery"
+        Log.write("\(why): normal sleep in \(Int(wait))s unless AC returns")
+    }
+
+    func cancelPending() {
+        if pending != nil { Log.write("cooldown cancelled") }
+        pending?.cancel()
+        pending = nil
+        pendingFireAt = nil
+        pendingStartedAt = nil
+    }
+
+    func apply(_ on: Bool, reason: String) {
+        if sleepDisabled == on { return }
+        let manual = reason.hasPrefix("menu")
+        if Power.writeSleepDisabled(on, allowPrompt: manual) {
+            sleepDisabled = on
+            lastError = nil
+            Log.write("SleepDisabled=\(on ? 1 : 0) (\(reason))")
+        } else {
+            lastError = "Can't change pmset. Run install-sudoers.sh"
+            sleepDisabled = Power.readSleepDisabled()
+        }
+    }
+
+    // MARK: menu
+
+    func buildMenu() {
+        menu.delegate = self
+        statusLine.isEnabled = false
+        menu.addItem(statusLine)
+        errorLine.isEnabled = false
+        errorLine.isHidden = true
+        menu.addItem(errorLine)
+        menu.addItem(.separator())
+        policyHeader.isEnabled = false
+        policyHeader.toolTip = "Idle timers from System Settings > Battery. \"Always Awake\" overrides them; \"Normal Sleep\" follows them."
+        menu.addItem(policyHeader)
+        for _ in 0..<2 {
+            let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            it.indentationLevel = 1
+            menu.addItem(it)
+            policyLines.append(it)
+        }
+        menu.addItem(.separator())
+        for m in Mode.allCases {
+            let it = NSMenuItem(title: m.title, action: #selector(pickMode(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = m.rawValue
+            it.toolTip = m.tip
+            menu.addItem(it)
+            modeItems[m] = it
+            guard let note = m.note else { continue }
+            let n = NSMenuItem(title: note, action: nil, keyEquivalent: "")
+            n.isEnabled = false
+            n.indentationLevel = 1
+            n.toolTip = m.tip
+            n.attributedTitle = NSAttributedString(string: note, attributes: [
+                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+            menu.addItem(n)
+        }
+        let grace = NSMenuItem(title: "Battery Grace", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for secs in Self.graceChoices {
+            let it = NSMenuItem(title: Self.graceTitle(secs), action: #selector(pickGrace(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = secs
+            sub.addItem(it)
+            graceItems[secs] = it
+        }
+        grace.submenu = sub
+        menu.addItem(grace)
+        menu.addItem(.separator())
+        loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(loginItem)
+        hideAutoItem = NSMenuItem(title: "Hide Icon in Auto Mode", action: #selector(toggleHideAuto), keyEquivalent: "")
+        hideAutoItem.target = self
+        hideAutoItem.toolTip = "The icon leaves the menu bar while Auto is selected. To get this menu back while hidden, open ClamshellAwake again (Spotlight, Finder, Launchpad)."
+        menu.addItem(hideAutoItem)
+        let log = NSMenuItem(title: "Open Log", action: #selector(openLog), keyEquivalent: "")
+        log.target = self
+        menu.addItem(log)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit ClamshellAwake", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
+        statusItem.menu = menu
+        refreshUI()
+    }
+
+    @objc func pickMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let m = Mode(rawValue: raw) else { return }
+        mode = m
+        Log.write("mode -> \(m.rawValue)")
+        evaluate(reason: "menu: \(m.rawValue)")
+    }
+
+    static func graceTitle(_ secs: Int) -> String {
+        secs < 60 ? "\(secs) sec" : secs < 3600 ? "\(secs / 60) min" : "\(secs / 3600) hr"
+    }
+
+    @objc func pickGrace(_ sender: NSMenuItem) {
+        guard let secs = sender.representedObject as? Int else { return }
+        defaults.set(secs, forKey: "graceSeconds")
+        Log.write("battery grace -> \(secs)s")
+        if pending != nil, let started = pendingStartedAt {
+            // Cooldown already running: keep its start time, apply the new length.
+            // If that deadline is already past, the work item fires immediately.
+            cancelPending()
+            schedule(startedAt: started)
+        }
+        refreshUI()
+    }
+
+    @objc func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
+        } catch {
+            Log.write("login item error: \(error)")
+            lastError = "Login item: \(error.localizedDescription)"
+        }
+        refreshUI()
+    }
+
+    func registerLoginItemOnFirstRun() {
+        guard !defaults.bool(forKey: "loginItemOffered") else { return }
+        defaults.set(true, forKey: "loginItemOffered")
+        do { try SMAppService.mainApp.register(); Log.write("login item registered") }
+        catch { Log.write("login item register failed: \(error)") }
+    }
+
+    @objc func openLog() {
+        NSWorkspace.shared.open(Log.url)
+    }
+
+    /// Launching the app while it runs (Finder, Spotlight, Alfred, `open -a`)
+    /// lands here via the reopen event: show the icon and drop its menu.
+    func revealMenu() {
+        pinnedVisible = true
+        if !statusItem.isVisible {
+            statusItem.isVisible = true
+            Log.write("icon shown (reopen)")
+        }
+        // The item needs a run-loop turn on screen before its button takes a click.
+        DispatchQueue.main.async { [weak self] in self?.statusItem.button?.performClick(nil) }
+    }
+
+    @objc func toggleHideAuto() {
+        hideInAuto.toggle()
+        Log.write("hide icon in Auto -> \(hideInAuto)")
+        refreshUI()
+    }
+
+    func applyVisibility() {
+        let attention = lastError != nil || !sudoOK
+        let show = mode != .auto || attention || !hideInAuto || pinnedVisible
+        guard statusItem.isVisible != show else { return }
+        statusItem.isVisible = show
+        Log.write("icon \(show ? "shown" : "hidden") (mode=\(mode.rawValue))")
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        // Re-read the real flag in case it was changed from a terminal.
+        let real = Power.readSleepDisabled()
+        if real != sleepDisabled {
+            Log.write("flag changed externally: \(real.map { $0 ? "1" : "0" } ?? "?")")
+            sleepDisabled = real
+            if mode == .auto { evaluate(reason: "external change") }
+        }
+        if !sudoOK { checkSudo() }
+        let policy = Power.policySummary()
+        for (i, it) in policyLines.enumerated() {
+            it.title = i < policy.count ? policy[i] : ""
+            it.isHidden = i >= policy.count
+        }
+        refreshUI()
+        guard pending != nil else { return }
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refreshUI() }
+        RunLoop.main.add(t, forMode: .common)   // menu tracking uses eventTracking mode
+        menuTimer = t
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuTimer?.invalidate()
+        menuTimer = nil
+        guard pinnedVisible else { return }
+        pinnedVisible = false
+        // The picked item's action is still pending; let it run first.
+        DispatchQueue.main.async { [weak self] in self?.refreshUI() }
+    }
+
+    // MARK: UI state
+
+    func refreshUI() {
+        let ac = Power.onAC()
+        let src = ac ? "on AC" : "on battery"
+        var badge: String
+        var text: String
+        switch (sleepDisabled, pending) {
+        case (true, .some):
+            badge = "hourglass"
+            let left = max(0, Int((pendingFireAt ?? Date()).timeIntervalSinceNow.rounded()))
+            text = String(format: "Awake · normal sleep in %d:%02d", left / 60, left % 60)
+        case (true, nil):
+            badge = "bolt.fill"
+            text = "Awake · \(src)"
+            if mode == .auto && !ac && lidClosed == false { text += " · grace starts at lid close" }
+        case (false, _):
+            badge = "moon.fill"
+            text = "Normal sleep · \(src)"
+        case (nil, _):
+            badge = "questionmark"
+            text = "Unknown state · \(src)"
+        }
+        if mode != .auto { text += " (manual)" }
+        if !sudoOK && mode == .auto { badge = "exclamationmark" }
+        statusLine.title = text
+        let warning = lastError ?? (sudoOK ? nil :
+            "⚠ No passwordless sudo: Auto can't restore sleep on battery. Run install-sudoers.sh")
+        errorLine.title = warning ?? ""
+        errorLine.isHidden = warning == nil
+        for (m, it) in modeItems { it.state = (m == mode) ? .on : .off }
+        let g = Int(delaySeconds)
+        for (secs, it) in graceItems { it.state = (secs == g) ? .on : .off }
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        hideAutoItem.state = hideInAuto ? .on : .off
+        statusItem.button?.image = Self.icon(badge: badge)
+        statusItem.button?.toolTip = "ClamshellAwake: \(text)"
+        applyVisibility()
+    }
+
+    /// Laptop glyph with a small knocked-out badge, as a template image so it
+    /// follows the menu bar's light/dark appearance.
+    static func icon(badge: String) -> NSImage {
+        let img = NSImage(size: NSSize(width: 24, height: 18), flipped: false) { rect in
+            let baseCfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+            guard let base = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: nil)?
+                .withSymbolConfiguration(baseCfg) else { return false }
+            let bs = base.size
+            base.draw(in: NSRect(x: (rect.width - bs.width) / 2 - 1, y: (rect.height - bs.height) / 2,
+                                 width: bs.width, height: bs.height))
+            let badgeCfg = NSImage.SymbolConfiguration(pointSize: 7, weight: .black)
+            guard let b = NSImage(systemSymbolName: badge, accessibilityDescription: nil)?
+                .withSymbolConfiguration(badgeCfg) else { return true }
+            let d: CGFloat = 11
+            let circle = NSRect(x: rect.width - d, y: 0, width: d, height: d)
+            if let ctx = NSGraphicsContext.current {
+                ctx.saveGraphicsState()
+                ctx.compositingOperation = .destinationOut
+                NSColor.black.setFill()
+                NSBezierPath(ovalIn: circle).fill()
+                ctx.restoreGraphicsState()
+            }
+            let s = b.size
+            b.draw(in: NSRect(x: circle.midX - s.width / 2, y: circle.midY - s.height / 2, width: s.width, height: s.height))
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let controller = Controller()
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        controller.start()
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        controller.revealMenu()
+        return false
+    }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
