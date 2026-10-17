@@ -20,6 +20,15 @@ disablesleep`, is all or nothing: leave it on, and a MacBook in a bag can't
 sleep, gets hot, and runs the battery flat. ClamshellAwake turns it on and
 off for you, based on power and the lid.
 
+**Mac mini, Mac Studio, iMac or Mac Pro? You don't need this app.** These
+Macs have no lid and no battery. To keep one awake, run this in Terminal:
+
+```sh
+sudo pmset -a disablesleep 1
+```
+
+To turn normal sleep back on: `sudo pmset -a disablesleep 0`
+
 ## Install
 
 1. Download **[ClamshellAwake (DMG)](https://github.com/js-commit/clamshell-awake/releases/latest/download/clamshell-awake-macos.dmg)**.
@@ -136,8 +145,6 @@ If you removed the app without quitting it from the menu first, also run
 
 - **The icon is gone.** You may have turned on **Hide Icon in Auto Mode**.
   Open ClamshellAwake again from Spotlight or Finder, and the menu opens.
-- **A desktop Mac (mini, Studio, iMac).** These Macs have no lid, so Auto
-  works the same as Always Awake when plugged in.
 - **With an external display, keyboard and power connected**, macOS already
   keeps a closed MacBook awake (Apple's clamshell mode). You don't need this
   app for that.
