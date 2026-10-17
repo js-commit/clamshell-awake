@@ -31,7 +31,7 @@ func icon(badge: String) -> NSImage {
 }
 
 let scale: CGFloat = 4
-let badges = ["bolt.fill", "hourglass", "moon.fill"]
+let badges = ["sun.max.fill", "hourglass", "moon.fill", "exclamationmark", "questionmark"]
 let w = Int(CGFloat(badges.count) * 40 * scale), h = Int(2 * 22 * scale)
 let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8,
                            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
