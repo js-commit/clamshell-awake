@@ -1,6 +1,6 @@
 # Outage 2026-09-09 17:39:51 – 17:55:05 (15m14s)
 
-Auto mode, grace = 300s. Server unreachable for 15 minutes.
+Auto mode, grace = 300s. The Mac (running background jobs) was unreachable for 15 minutes.
 
 ## Timeline (app log + `pmset -g log` + powerd unified log)
 
@@ -79,7 +79,7 @@ suppressing clamshell sleep. The code does not read it.)
 
 **(a) Guarantee a wake.** On `willSleep` while auto+battery, `pmset schedule wake`
 a few minutes out; re-evaluate on wake. Caveats: needs root, and the sudoers rule
-is deliberately exact-argv (e607841) so it needs a wildcard for `schedule wake`/
+is deliberately exact-argv, so it needs a wildcard for `schedule wake`/
 `cancel`. Worse, the 09-08 log shows ~30 SleepService dark wakes with zero app log
 lines — `NSWorkspace.willSleep/didWake` do not fire in dark wake, so the app can't
 reschedule after a wake that finds it still on battery. Needs
