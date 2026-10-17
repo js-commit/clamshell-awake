@@ -1,59 +1,162 @@
 # ClamshellAwake
 
-Menu bar toggle for macOS's only lid-closed sleep override, `pmset disablesleep`.
-Keeps a MacBook awake with the lid shut and no external display, so background
-agents keep running.
+Keep your MacBook awake with the lid closed. You don't need an external
+display or a dummy plug. When you unplug it and close the lid, it goes back
+to sleep by itself.
 
-- **Auto**: on AC, sleep is disabled immediately. On battery the override is held
-  while the lid is open, and the grace period (default 10 min, set under "Battery
-  Grace"; cancelled if AC returns) starts when the lid *closes*. So unplugging and
-  carrying on with the lid open costs nothing, and shutting the lid gives you the
-  full grace to plug back in.
-  The flag has to already be set at the lid close: macOS goes from lid-closed to
-  asleep in about 8 ms, far too fast to react to. The cost is that a lid-open Mac
-  left on battery will not idle-sleep (the display still sleeps on its own timer).
-  Keying the grace to the unplug instead is what caused the outage in
-  `INCIDENT-2026-09-09.md`.
-  When the grace expires with the lid shut, the app puts the Mac to sleep itself
-  (`IOPMSleepSystem`, the Apple-menu sleep). Clearing the flag alone does nothing
-  once the lid is already closed: macOS only consults it at the lid-close moment,
-  and the idle timer it falls back to is blocked by any app holding a
-  PreventUserIdleSystemSleep assertion. That is `INCIDENT-2026-09-12.md`.
-- **Always Awake**: `disablesleep 1`. The Mac never sleeps, lid open or closed, whatever
-  the System Settings timers say. The display still turns off on its own timer.
-- **Normal Sleep**: `disablesleep 0`, i.e. macOS's own rules. Closing the lid sleeps the Mac
-  (unless an external display, keyboard/mouse and power are all attached, Apple's built-in
-  clamshell mode). With the lid open, the idle timers from System Settings > Battery apply.
-  The menu shows those timers for each power profile, read from `pmset -g custom` when it opens.
-- Listens for AC/battery transitions through IOKit (`IOPSCreateLimitedPowerNotification`)
-  and for lid open/close on IOPMrootDomain's general interest channel, reading
-  `AppleClamshellState`; no polling. A Mac that cannot read its lid state keeps the
-  old unplug-keyed grace. Only shells out when the flag actually needs to change.
-- The menu spells out what Auto costs: an indented note under it warns that on
-  battery the Mac stays awake while the lid is open, and each mode carries a
-  tooltip with the full behaviour. Always Awake and Normal Sleep are unaffected by
-  the lid logic - only Auto consults the lid state.
-- Icon: laptop with a bolt (awake), hourglass (cooldown running), moon (normal sleep).
-  In Auto mode the icon is hidden (default; "Hide Icon in Auto Mode" in the menu turns that
-  off). It shows in Always Awake and Normal Sleep, and whenever something needs attention
-  (missing sudoers rule, pmset failure). To get the menu while hidden, open ClamshellAwake
-  again from Spotlight, Finder, Launchpad or `open -a ClamshellAwake`: the icon appears and
-  its menu drops; it hides again when the menu closes if Auto is still selected.
-- Log: `~/Library/Logs/clamshell-awake.log`.
+<img src="docs/menu.png" alt="ClamshellAwake menu" width="420">
+
+A MacBook goes to sleep as soon as you close the lid, unless an external
+display is connected. That is bad if you run long jobs with the lid shut,
+such as builds, downloads, AI agents or a small home server. macOS has one
+hidden override, `pmset disablesleep`. But if you leave it on, a MacBook
+in a bag can't sleep. It gets hot and the battery goes flat.
+
+ClamshellAwake is a small menu bar app that controls that switch for you.
+When the Mac is plugged in, it stays awake with the lid closed. When it is
+on battery and you close the lid, the Mac goes to sleep after a short delay.
+If you plug it back in before the delay ends, it stays awake.
 
 ## Install
 
+1. Download **[ClamshellAwake (DMG)](https://github.com/js-commit/clamshell-awake/releases/latest/download/clamshell-awake-macos.dmg)**.
+2. Open the DMG and drag **ClamshellAwake** into **Applications**.
+3. Open ClamshellAwake from Applications. A laptop icon appears in the menu bar.
+4. Click **Set Up…** and enter your Mac password once. See
+   [What the password is for](#what-the-password-is-for).
+
+That is all. The app starts again each time you log in.
+
+Requires macOS 13 Ventura or later, on Apple silicon or Intel. The app is
+signed and notarized by Apple, so it opens normally.
+
+## Modes
+
+| Mode | Plugged in | On battery |
+|---|---|---|
+| **Auto** (default) | Stays awake with the lid closed | When you close the lid, sleeps after the **Sleep Delay on Battery** (default 10 min) |
+| **Always Awake** | Stays awake | Stays awake, until the battery is empty |
+| **Normal Sleep** | Normal macOS rules | Normal macOS rules |
+
+In all modes the display still turns off on its normal timer.
+
+**Auto has one trade-off.** On battery with the lid **open**, the Mac does
+not sleep when it is idle. The app must keep sleep off *before* you close
+the lid, because macOS goes to sleep about 8 ms after the lid closes, which
+is too fast for any app. The top of the menu tells you when this applies.
+
+The top line of the menu always answers one question: *will the Mac sleep if
+I close the lid now?*
+
+| Icon badge | Meaning |
+|---|---|
+| ☀︎ sun | Stays awake with the lid closed |
+| ⌛ hourglass | Countdown: sleeps soon unless you plug in |
+| ☾ moon | Sleeps when the lid closes |
+| ! | Setup is not finished |
+| ? | The app can't read the sleep setting (see the log) |
+
+## Safety
+
+- **Don't put an awake Mac in a bag or sleeve.** It can't cool down there.
+  Use **Auto**: it puts the Mac to sleep on battery when the lid is closed.
+- **Always Awake** ignores battery. Use it only when the Mac is on a desk.
+- Put a closed, awake laptop on a hard surface so air can move around it.
+- **Quit and Restore Normal Sleep** in the menu turns normal sleep back on.
+  If you log out or restart, the setting stays as it was.
+
+## What the password is for
+
+macOS lets only an administrator change `disablesleep`. The app does not
+ask for your password each time. Instead, setup adds one rule to the file
+`/etc/sudoers.d/clamshell-awake`. The rule lets your user run exactly these
+two commands, and nothing else, without a password:
+
 ```
-./install-sudoers.sh   # once, asks for your password; allows exactly two pmset commands
-./build.sh             # builds ~/Applications/ClamshellAwake.app and launches it
+/usr/bin/pmset -a disablesleep 1
+/usr/bin/pmset -a disablesleep 0
 ```
 
-The app registers itself as a login item on first run (System Settings > General > Login Items).
-Without the sudoers rule, manual toggles fall back to an admin password prompt and Auto mode
-cannot change the flag.
+The app checks the file with `visudo` before it installs it. The app does
+not keep your password.
 
-## Notes
+## Uninstall
 
-- `disablesleep` is global on this macOS: `pmset -c` and `pmset -b` both set the same flag,
-  which is why the app manages it by power source instead.
-- Quitting the app leaves the flag as it is. `sudo pmset -a disablesleep 0` restores defaults.
+1. In the menu, choose **Quit and Restore Normal Sleep**.
+2. Drag ClamshellAwake from Applications to the Trash.
+3. In Terminal, remove the rule:
+   ```sh
+   sudo rm /etc/sudoers.d/clamshell-awake
+   ```
+4. Optional: remove the settings and the log:
+   ```sh
+   defaults delete com.jsyntax.clamshell-awake
+   rm ~/Library/Logs/clamshell-awake.log
+   ```
+
+If you removed the app without quitting it from the menu first, also run
+`sudo pmset -a disablesleep 0`.
+
+## Troubleshooting
+
+- **The icon is gone.** You may have turned on **Hide Icon in Auto Mode**.
+  Open ClamshellAwake again from Spotlight or Finder, and the menu opens.
+- **A desktop Mac (mini, Studio, iMac).** These Macs have no lid, so Auto
+  works the same as Always Awake when plugged in.
+- **With an external display, keyboard and power connected**, macOS already
+  keeps a closed MacBook awake (Apple's clamshell mode). You don't need this
+  app for that.
+- **The log** is at `~/Library/Logs/clamshell-awake.log`. To open it, choose
+  **Open Log** in the menu. It records each change the app makes and the reason.
+- **Bugs and questions:** [open an issue](https://github.com/js-commit/clamshell-awake/issues).
+
+## Build from source
+
+You need the Xcode Command Line Tools (`xcode-select --install`).
+
+```sh
+git clone https://github.com/js-commit/clamshell-awake.git
+cd clamshell-awake
+./build.sh
+```
+
+`build.sh` builds a universal app, copies it to `~/Applications` and opens
+it. The whole app is one Swift file, `Sources/main.swift`.
+
+## How it works
+
+- It listens for power changes (`IOPSCreateLimitedPowerNotification`) and for
+  lid changes (`AppleClamshellState` on `IOPMrootDomain`). It does not poll.
+  It runs `pmset` only when the setting must change.
+- On battery, the countdown starts when the lid closes, not when you unplug.
+  It uses a wall-clock deadline, so time asleep counts.
+- When the countdown ends with the lid closed, the app puts the Mac to sleep
+  itself (`IOPMSleepSystem`, the same as Apple menu > Sleep). macOS reads
+  `disablesleep` only at the moment the lid closes. Also, an app that blocks
+  idle sleep (audio, a video editor, a backup) can keep the Mac awake for hours.
+- `pmset -c` and `pmset -b` both set the same `disablesleep` flag, so the
+  app does the per-power-source logic itself.
+
+Two incidents shaped this design. Each write-up gives the log timeline and
+the root cause:
+- [Slept on battery and missed the charger](docs/incident-2026-09-09-slept-on-battery.md)
+- [Stayed awake in a bag for 4 hours](docs/incident-2026-09-12-awake-in-a-bag.md)
+
+## Releasing
+
+`./release.sh` builds the app and signs it with a Developer ID. It notarizes
+and staples both the app and the DMG, then writes
+`dist/clamshell-awake-macos.dmg`. It needs a "Developer ID Application"
+identity in the keychain, and the environment variables
+`NOTARY_TOOL_APPLE_ID`, `NOTARY_TOOL_PASSWORD` and `NOTARY_TOOL_TEAM_ID`.
+Then:
+
+```sh
+gh release create vX.Y.Z dist/clamshell-awake-macos.dmg --title "ClamshellAwake X.Y.Z" --notes-file notes.md
+```
+
+Update `CFBundleShortVersionString` in `Info.plist` first.
+
+## License
+
+[MIT](LICENSE)
