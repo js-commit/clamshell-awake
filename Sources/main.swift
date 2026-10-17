@@ -33,7 +33,8 @@ enum Mode: String, CaseIterable {
     var tip: String {
         switch self {
         case .auto:
-            return "Plugged in: never sleeps, so the Mac keeps working with the lid closed.\n"
+            return "Recommended for long-running tasks such as AI agents, builds and downloads.\n"
+                + "Plugged in: never sleeps, so the Mac keeps working with the lid closed.\n"
                 + "On battery: closing the lid does not sleep the Mac at once. It starts the "
                 + "Sleep Delay on Battery, and the Mac sleeps if it is not plugged in before that runs out.\n"
                 + "Trade-off: on battery with the lid open, the Mac will not sleep by itself, so left "
@@ -261,9 +262,7 @@ final class Controller: NSObject, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let menu = NSMenu()
     var setupItems: [NSMenuItem] = []   // "Finish Setup…" block, shown while the rule is missing
-    var statusLine = NSMenuItem()       // answers "does closing the lid sleep it?"
-    var detailLine = NSMenuItem()       // why: power source, mode, or what to do
-    var errorLine = NSMenuItem()
+    let header = StatusHeader()         // answers "does closing the lid sleep it?", and why
     var modeItems: [Mode: NSMenuItem] = [:]
     var delayItem = NSMenuItem()
     var graceItems: [Int: NSMenuItem] = [:]
@@ -512,11 +511,9 @@ final class Controller: NSObject, NSMenuDelegate {
         setupItems = Self.withSubtitle(setup, "One-time step. Auto needs it to work.") + [.separator()]
         setupItems.forEach(menu.addItem)
 
-        for it in [statusLine, detailLine, errorLine] {
-            it.isEnabled = false
-            menu.addItem(it)
-        }
-        errorLine.isHidden = true
+        let headerItem = NSMenuItem()
+        headerItem.view = header
+        menu.addItem(headerItem)
         menu.addItem(.separator())
 
         let sub = NSMenu()
@@ -528,12 +525,13 @@ final class Controller: NSObject, NSMenuDelegate {
             graceItems[secs] = it
         }
         delayItem.submenu = sub
-        delayItem.indentationLevel = 1
+        delayItem.indentationLevel = 2
         delayItem.toolTip = "On battery, how long Auto keeps the Mac awake after you close the lid. "
             + "Plug in before it runs out and the Mac stays awake. Changing it during a countdown "
             + "keeps the countdown's start time."
         for m in Mode.allCases {
-            let it = NSMenuItem(title: m.title, action: #selector(pickMode(_:)), keyEquivalent: "")
+            let it = NSMenuItem(title: m == .auto ? "Auto (Recommended)" : m.title,
+                                action: #selector(pickMode(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = m.rawValue
             it.toolTip = m.tip
@@ -595,10 +593,10 @@ final class Controller: NSObject, NSMenuDelegate {
         return [item, n]
     }
 
-    static func small(_ s: String, color: NSColor = .secondaryLabelColor) -> NSAttributedString {
+    static func small(_ s: String) -> NSAttributedString {
         NSAttributedString(string: s, attributes: [
             .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
-            .foregroundColor: color,
+            .foregroundColor: NSColor.secondaryLabelColor,
         ])
     }
 
@@ -777,15 +775,8 @@ final class Controller: NSObject, NSMenuDelegate {
             detail = "\(src) \u{00B7} Open Log for details"
         }
         if !sudoOK && mode == .auto { badge = "exclamationmark" }
-        statusLine.attributedTitle = NSAttributedString(string: head, attributes: [
-            .font: NSFont.systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold),
-            .foregroundColor: NSColor.labelColor,
-        ])
-        detailLine.attributedTitle = Self.small(detail)
-        statusLine.toolTip = mode.tip
-        detailLine.toolTip = mode.tip
-        errorLine.attributedTitle = Self.small("\u{26A0}\u{FE0E} " + (lastError ?? ""), color: .systemRed)
-        errorLine.isHidden = lastError == nil
+        header.update(head: head, detail: detail, error: lastError.map { "\u{26A0}\u{FE0E} " + $0 })
+        header.toolTip = mode.tip
         setupItems.forEach { $0.isHidden = sudoOK }
         for (m, it) in modeItems { it.state = (m == mode) ? .on : .off }
         delayItem.title = "Sleep Delay on Battery: \(delay)"
@@ -829,6 +820,50 @@ final class Controller: NSObject, NSMenuDelegate {
         }
         img.isTemplate = true
         return img
+    }
+}
+
+/// The status block at the top of the menu. A custom view because macOS
+/// draws a disabled menu item greyed out whatever its colours, and this is
+/// the one line the menu exists to answer.
+final class StatusHeader: NSView {
+    /// Lines the text up with the menu item titles, past the checkmark column
+    /// (measured; macOS 26 menus pad wider than earlier ones).
+    static var inset: CGFloat {
+        if #available(macOS 26, *) { return 30 }
+        return 21
+    }
+    let head = NSTextField(labelWithString: "")
+    let detail = NSTextField(labelWithString: "")
+    let error = NSTextField(labelWithString: "")
+    let stack: NSStackView
+
+    init() {
+        stack = NSStackView(views: [head, detail, error])
+        super.init(frame: .zero)
+        head.font = .systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold)
+        detail.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
+        detail.textColor = .secondaryLabelColor
+        error.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
+        error.textColor = .systemRed
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.edgeInsets = NSEdgeInsets(top: 3, left: Self.inset, bottom: 3, right: 14)
+        stack.frame = bounds
+        stack.autoresizingMask = [.width, .height]
+        addSubview(stack)
+        autoresizingMask = [.width]   // the menu widens it to its own width
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func update(head h: String, detail d: String, error e: String?) {
+        head.stringValue = h
+        detail.stringValue = d
+        error.stringValue = e ?? ""
+        error.isHidden = e == nil
+        setFrameSize(stack.fittingSize)
     }
 }
 

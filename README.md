@@ -4,7 +4,7 @@ Keep your MacBook awake with the lid closed. You don't need an external
 display or a dummy plug. When you unplug it and close the lid, it goes back
 to sleep by itself.
 
-<img src="docs/menu.png" alt="ClamshellAwake menu" width="420">
+<img src="docs/menu.png" alt="ClamshellAwake menu" width="332">
 
 A MacBook goes to sleep as soon as you close the lid, unless an external
 display is connected. That is bad if you run long jobs with the lid shut,
@@ -22,8 +22,11 @@ If you plug it back in before the delay ends, it stays awake.
 1. Download **[ClamshellAwake (DMG)](https://github.com/js-commit/clamshell-awake/releases/latest/download/clamshell-awake-macos.dmg)**.
 2. Open the DMG and drag **ClamshellAwake** into **Applications**.
 3. Open ClamshellAwake from Applications. A laptop icon appears in the menu bar.
-4. Click **Set Up…** and enter your Mac password once. See
-   [What the password is for](#what-the-password-is-for).
+4. Click **Set Up…** and enter your Mac password once. macOS shows a
+   generic warning that it "could not verify this script". It shows this
+   for every app that asks for admin rights this way. See
+   [What the password is for](#what-the-password-is-for) for exactly what
+   the script does.
 
 That is all. The app starts again each time you log in.
 
@@ -34,11 +37,15 @@ signed and notarized by Apple, so it opens normally.
 
 | Mode | Plugged in | On battery |
 |---|---|---|
-| **Auto** (default) | Stays awake with the lid closed | When you close the lid, sleeps after the **Sleep Delay on Battery** (default 10 min) |
+| **Auto** (default, recommended) | Stays awake with the lid closed | When you close the lid, sleeps after the **Sleep Delay on Battery** (default 10 min) |
 | **Always Awake** | Stays awake | Stays awake, until the battery is empty |
 | **Normal Sleep** | Normal macOS rules | Normal macOS rules |
 
 In all modes the display still turns off on its normal timer.
+
+**Use Auto for long-running tasks such as AI agents, builds and downloads.**
+Plug in, close the lid, and the work continues. If you unplug and forget,
+Auto puts the Mac to sleep, so it doesn't stay hot in a bag.
 
 **Auto has one trade-off.** On battery with the lid **open**, the Mac does
 not sleep when it is idle. The app must keep sleep off *before* you close
@@ -78,7 +85,16 @@ two commands, and nothing else, without a password:
 ```
 
 The app checks the file with `visudo` before it installs it. The app does
-not keep your password.
+not keep your password. The password goes to macOS, not to the app.
+
+If you prefer Terminal, this command installs the same rule. After that,
+the app finds the rule and skips setup:
+
+```sh
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0" > /tmp/clamshell-awake \
+  && sudo visudo -cf /tmp/clamshell-awake \
+  && sudo install -o root -g wheel -m 0440 /tmp/clamshell-awake /etc/sudoers.d/clamshell-awake
+```
 
 ## Uninstall
 
