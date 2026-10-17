@@ -20,7 +20,7 @@ notarize() {
   local out
   out="$(xcrun notarytool submit "$1" --apple-id "$NOTARY_TOOL_APPLE_ID" \
     --password "$NOTARY_TOOL_PASSWORD" --team-id "$NOTARY_TOOL_TEAM_ID" --wait 2>&1)"
-  print -r -- "$out" | grep -E '^ *(id|status):'
+  print -r -- "$out" | grep -E '^ *(id|status):' | sort -u
   # notarytool can exit 0 on an Invalid result; trust only the status line.
   print -r -- "$out" | grep -q 'status: Accepted' || { print -u2 "notarization failed: $1"; exit 1; }
 }
